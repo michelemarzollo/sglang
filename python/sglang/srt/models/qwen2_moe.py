@@ -367,15 +367,52 @@ class EarlyGate:
         )
         self.is_enabled = self.n_preds > 0
 
+        # "early_gate" (default): run the future layer's gate on the current
+        # hidden states. "trained": use the per-layer predictors trained in
+        # the moe-activation-predictor repo (see expert_predictor.py).
+        self.predictor_mode = exp_args.get("predictor", "early_gate")
+        self.predictor_ckpt_root = exp_args.get("predictor_ckpt_root")
+        self.predictors = {}        # target_layer_id -> model | None (None: no ckpt)
+        if self.is_enabled and self.predictor_mode == "trained":
+            assert self.predictor_ckpt_root is not None, (
+                "exp_args['predictor_ckpt_root'] must be set when predictor='trained'"
+            )
+
+    def _get_predictor(self, target_layer_id):
+        # Lazily load (and cache) the predictor for target_layer_id; None when
+        # no checkpoint exists for this (layer, offset) pair.
+        if target_layer_id not in self.predictors:
+            from sglang.srt.models.expert_predictor import load_predictor
+
+            self.predictors[target_layer_id] = load_predictor(
+                self.predictor_ckpt_root,
+                target_layer_id,
+                self.prefetch_offset,
+                device=torch.device("cuda"),
+            )
+        return self.predictors[target_layer_id]
+
     def add_gate(self, layer_id, gate):
-        if not self.is_enabled: return 
+        if not self.is_enabled: return
         assert layer_id not in self.gates
         self.gates[layer_id] = gate
 
     def make_pred(self, layer_id, hidden_states):
-        if not self.is_enabled: return 
+        if not self.is_enabled: return
 
         next_layer_id = layer_id+self.prefetch_offset
+
+        if self.predictor_mode == "trained":
+            predictor = self._get_predictor(next_layer_id)
+            if predictor is not None:
+                logits = predictor(hidden_states)
+                self.preds[next_layer_id] = (
+                    logits.argsort(dim=-1, descending=True)[:, :self.n_preds]
+                    .to(torch.int32)
+                    .contiguous()
+                )
+            return
+
         if next_layer_id in self.gates:
             next_gate = self.gates[next_layer_id]
             router_logits, _ = next_gate(hidden_states)
