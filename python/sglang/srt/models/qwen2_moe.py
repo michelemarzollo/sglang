@@ -235,7 +235,6 @@ class Cache:
         self.dynamic_dat = OrderedDict()
 
         self.prefetched = []
-        self.init_random()
 
         self.n_hits = 0
         self.n_miss = 0
@@ -248,33 +247,26 @@ class Cache:
         self.record_activations = record_activations
         self.activations = []
 
+        self.hot_stats = {e: 0 for e in range(num_experts)}
+
+        self.init_random()
+
     def __exit__(self, exc_type, exc, tb):
         print(f"Cache {self.layer_id} for {self.rid} exited")
 
     def init_random(self):
+        with open(exp_args["hot_experts_file"], "r") as f:
+            _hot_experts = json.load(f)[str(self.layer_id)]
+            hot_experts = sorted(list(range(self.num_experts)), key=lambda e: _hot_experts[str(e)], reverse=True)
+        for e in hot_experts[:self.static_cap]:
+            self.static_dat[e] = 0
+
         for e in range(self.dynamic_cap):
             self.dynamic_dat[e] = 0
 
     def evict(self):
-        if self.dynamic_cap == 0: return
         if len(self.dynamic_dat) == self.dynamic_cap:
             self.dynamic_dat.popitem(last=False)
-
-    def populate_static(self, experts):
-        if exp_args["hot_experts_file"]:
-            with open(exp_args["hot_experts_file"], "r") as f:
-                _hot_experts = json.load(f)[str(self.layer_id)]
-                hot_experts = sorted(list(range(self.num_experts)), key=lambda e: _hot_experts[str(e)], reverse=True)
-        else:
-            for e in experts: self.static_stats[e] += 1
-            hot_experts = sorted(list(range(self.num_experts)), key=lambda e: self.static_stats[e], reverse=True)
-
-        assert len(self.static_dat) == 0
-        for e in hot_experts[:self.static_cap]:
-            print(e, _hot_experts[str(e)])
-            self.static_dat[e] = 0
-
-        assert len(self.static_dat) == 8
 
     def prefetch(self, prefetch_experts):
         self.prefetched = prefetch_experts
@@ -284,6 +276,8 @@ class Cache:
         misses = [e for e in experts if e not in hits]
 
         if is_decode:
+            for e in experts: self.hot_stats[e] += 1
+
             self.n_hits += len(hits)
             self.n_miss += len(misses)
             self.n_pref += len(self.prefetched)
@@ -297,19 +291,31 @@ class Cache:
                     }
                 )
 
-        for e in experts:
-            if e in self.static_dat:
-                pass
-            elif e in self.dynamic_dat:
-                self.dynamic_dat.move_to_end(e)
-            else:
-                self.evict()
-                self.dynamic_dat[e] = 0
+        if self.dynamic_cap > 0:
+            for e in experts:
+                if e in self.static_dat:
+                    pass
+                elif e in self.dynamic_dat:
+                    self.dynamic_dat.move_to_end(e)
+                else:
+                    self.evict()
+                    self.dynamic_dat[e] = 0
 
         return hits
 
     def get_experts_in_cache(self):
         return list(set(list(self.static_dat.keys()) + list(self.dynamic_dat.keys()) + self.prefetched))
+
+    def dump_hot_stats(self):
+        with open(os.path.join(EXP_DIR, "hot_stats.jsonl"), "a") as f:
+            f.write(json.dumps(
+                {
+                    "layer_id": self.layer_id,
+                    "rid": self.rid,
+                    "hot_stats": self.hot_stats
+                }
+            ))
+            f.write("\n")
 
     def dump_cache_stats(self):
         with open(os.path.join(EXP_DIR, "cache_stats.jsonl"), "a") as f:
@@ -341,6 +347,7 @@ class Cache:
 
     def flush(self):
         self.dump_cache_stats()
+        self.dump_hot_stats()
         if self.record_activations:
             self.dump_activations()
 
@@ -834,7 +841,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     self.cache[rid].prefetch(prefetch_experts[i])
 
             cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
-            assert len(cached_experts) == 8
         else:
             cached_experts = None
 
@@ -850,7 +856,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         n_tokens = selected.shape[0]
 
         if is_decode: assert n_tokens == len(forward_batch.rids)
-        if not is_decode: assert len(forward_batch.rids) == 1
 
         for i, rid in enumerate(forward_batch.rids):
             if rid not in RIDS: RIDS.append(rid)
@@ -861,9 +866,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 CacheRegistry.add(self.cache[rid])
 
             self.cache[rid].read(selected[i].tolist(), is_decode)
-
-            if not is_decode:
-                self.cache[rid].populate_static(selected.flatten().tolist())
 
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
