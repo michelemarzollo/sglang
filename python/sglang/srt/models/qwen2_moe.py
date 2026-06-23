@@ -377,19 +377,64 @@ class EarlyGate:
             assert self.predictor_ckpt_root is not None, (
                 "exp_args['predictor_ckpt_root'] must be set when predictor='trained'"
             )
+            self._validate_ckpt_root()
+
+    def _validate_ckpt_root(self):
+        # Fail loudly on a wrong/empty --predictor-ckpt-root. A bad path used to
+        # make every load_predictor() return None, silently turning
+        # predictor="trained" into "no prefetch" (indistinguishable from
+        # cache-only). NOTE: early_gate has no path to validate — it runs the
+        # model's own future-layer gate (add_gate), so only "trained" needs this.
+        from sglang.srt.models.expert_predictor import predictor_dir
+
+        root = self.predictor_ckpt_root
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"predictor_ckpt_root does not exist: {root!r}")
+
+        # At least one target layer must have a checkpoint for the configured
+        # offset; otherwise the path or offset is wrong. (A few legitimately
+        # untrained tail layers staying empty is fine — that's handled, and
+        # warned about, per-layer in _get_predictor.)
+        for d in os.listdir(root):
+            if not d.startswith("layer"):
+                continue
+            try:
+                target = int(d[len("layer"):])
+            except ValueError:
+                continue
+            ckpt = os.path.join(
+                predictor_dir(root, target, self.prefetch_offset), "best.pt"
+            )
+            if os.path.exists(ckpt):
+                return
+        raise FileNotFoundError(
+            f"No trained predictor checkpoints found under {root!r} for "
+            f"prefetch_offset={self.prefetch_offset} (looked for "
+            f"layer*/layer*_moe_hidden_states/latest/best.pt). Wrong path or offset?"
+        )
 
     def _get_predictor(self, target_layer_id):
-        # Lazily load (and cache) the predictor for target_layer_id; None when
-        # no checkpoint exists for this (layer, offset) pair.
+        # Lazily load (and cache) the predictor for target_layer_id. The root is
+        # validated up front (_validate_ckpt_root), so a None here means this
+        # specific (layer, offset) genuinely has no checkpoint (e.g. the
+        # untrained tail layers) -> warn once, no prefetch for that layer.
         if target_layer_id not in self.predictors:
             from sglang.srt.models.expert_predictor import load_predictor
 
-            self.predictors[target_layer_id] = load_predictor(
+            pred = load_predictor(
                 self.predictor_ckpt_root,
                 target_layer_id,
                 self.prefetch_offset,
                 device=torch.device("cuda"),
             )
+            if pred is None:
+                logger.warning(
+                    "No trained predictor for target_layer=%d (offset=%d); "
+                    "no prefetch for this layer.",
+                    target_layer_id,
+                    self.prefetch_offset,
+                )
+            self.predictors[target_layer_id] = pred
         return self.predictors[target_layer_id]
 
     def add_gate(self, layer_id, gate):
