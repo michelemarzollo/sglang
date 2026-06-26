@@ -249,23 +249,43 @@ class Cache:
 
         self.hot_stats = {e: 0 for e in range(num_experts)}
 
+        # Dynamic-cache eviction policy: "lru" (least-recently-used, default) or
+        # "lfu" (least-frequently-used over the sequence; ties -> LRU). access_ct
+        # tracks per-expert usage frequency for this request, used by LFU evict.
+        self.policy = exp_args.get("cache_policy", "lru")
+        self.access_ct = {}
+
         self.init_random()
 
     def __exit__(self, exc_type, exc, tb):
         print(f"Cache {self.layer_id} for {self.rid} exited")
 
     def init_random(self):
-        with open(exp_args["hot_experts_file"], "r") as f:
-            _hot_experts = json.load(f)[str(self.layer_id)]
-            hot_experts = sorted(list(range(self.num_experts)), key=lambda e: _hot_experts[str(e)], reverse=True)
-        for e in hot_experts[:self.static_cap]:
-            self.static_dat[e] = 0
+        # Static cache is seeded from per-layer hot-expert stats. Skip the file
+        # read entirely when there's no static cache (static_cap=0, e.g. the
+        # draft's own pure-dynamic cache) or when this layer has no stats (e.g.
+        # the MTP draft layer is absent from hot_experts.json).
+        if self.static_cap > 0:
+            with open(exp_args["hot_experts_file"], "r") as f:
+                _hot_experts = json.load(f).get(str(self.layer_id))
+            if _hot_experts is not None:
+                hot_experts = sorted(list(range(self.num_experts)), key=lambda e: _hot_experts[str(e)], reverse=True)
+                for e in hot_experts[:self.static_cap]:
+                    self.static_dat[e] = 0
 
         for e in range(self.dynamic_cap):
             self.dynamic_dat[e] = 0
 
     def evict(self):
-        if len(self.dynamic_dat) == self.dynamic_cap:
+        if len(self.dynamic_dat) < self.dynamic_cap:
+            return
+        if self.policy == "lfu":
+            # Evict the least-frequently-used cached expert. dynamic_dat iterates
+            # oldest-first, so min() returns the LRU among the lowest-frequency
+            # experts -> frequency primary, recency tiebreak.
+            victim = min(self.dynamic_dat, key=lambda e: self.access_ct.get(e, 0))
+            del self.dynamic_dat[victim]
+        else:  # "lru"
             self.dynamic_dat.popitem(last=False)
 
     def prefetch(self, prefetch_experts):
@@ -292,16 +312,54 @@ class Cache:
                 )
 
         if self.dynamic_cap > 0:
-            for e in experts:
-                if e in self.static_dat:
-                    pass
-                elif e in self.dynamic_dat:
-                    self.dynamic_dat.move_to_end(e)
-                else:
-                    self.evict()
-                    self.dynamic_dat[e] = 0
+            self._update_lru(experts)
 
         return hits
+
+    def _update_lru(self, experts):
+        for e in experts:
+            self.access_ct[e] = self.access_ct.get(e, 0) + 1   # per-sequence frequency (for LFU)
+            if e in self.static_dat:
+                pass
+            elif e in self.dynamic_dat:
+                self.dynamic_dat.move_to_end(e)   # recency (LRU + LFU tiebreak)
+            else:
+                self.evict()
+                self.dynamic_dat[e] = 0
+
+    def read_verify(self, tokens_experts):
+        """Record one speculative *verify* step (K+1 candidate tokens).
+
+        All candidate tokens route against the SAME frozen cache snapshot, then
+        the dynamic LRU is updated with ALL experts used in verification (not
+        just accepted ones) — decided to be fine and potentially better for
+        future-activation prediction. `tokens_experts` is a list of per-token
+        expert lists; recorded as a list-of-lists so parse_spec_decode can
+        recover per-expert row counts. accept_len is captured separately from
+        the API meta_info, not here (it is only known after the forward)."""
+        resident = set(self.static_dat) | set(self.dynamic_dat) | set(self.prefetched)
+        flat = [e for tex in tokens_experts for e in tex]
+        hits = [e for e in flat if e in resident]
+
+        for e in flat:
+            self.hot_stats[e] += 1
+        self.n_hits += len(hits)
+        self.n_miss += len(flat) - len(hits)
+        # prefetch precision is counted per candidate token, mirroring decode.
+        self.n_pref += len(self.prefetched) * len(tokens_experts)
+        self.n_corr_pref += len([e for e in flat if e in self.prefetched])
+
+        if self.record_activations:
+            self.activations.append(
+                {
+                    "active_experts": [list(tex) for tex in tokens_experts],
+                    "in_cache": list(self.static_dat.keys()) + list(self.dynamic_dat.keys()),
+                    "prefetched": self.prefetched,
+                }
+            )
+
+        if self.dynamic_cap > 0:
+            self._update_lru(flat)
 
     def get_experts_in_cache(self):
         return list(set(list(self.static_dat.keys()) + list(self.dynamic_dat.keys()) + self.prefetched))
@@ -668,7 +726,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
-        early_gate.add_gate(layer_id, self.gate)
+        # The MTP/nextn draft head is read-only and never prefetches, so it must
+        # NOT register its gate: early_gate is a global singleton shared with the
+        # target model, and the draft's layer_id collides with a target layer's
+        # (add_gate would assert). Only target layers register.
+        if not is_nextn:
+            early_gate.add_gate(layer_id, self.gate)
 
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
@@ -831,31 +894,83 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
 
         num_tokens, n_experts = router_logits.shape
-        is_decode = forward_batch.batch_size == num_tokens
+        bs = forward_batch.batch_size
 
-        if is_decode:
-            early_gate.make_pred(self.layer_id, hidden_states, forward_batch.rids)
+        # The MTP/nextn draft head never touches the TARGET's cache (no prefetch,
+        # no target-LRU mutation). Two variants via draft_topk_method:
+        #   "vanilla" (default): original MTP, true top-k routing.
+        #   "cache_aware": the draft keeps its OWN per-request dynamic cache
+        #     (pure dynamic, static_cap=0, NOT in CacheRegistry so its layer_id
+        #     can't collide with a target layer) and routes against it, then
+        #     updates that own cache with what it selected. Still read-only w.r.t.
+        #     the target.
+        if self.is_nextn:
+            # Needs a dynamic cache to route against (static_cap=0 for the draft).
+            draft_cache_aware = (not isinstance(self.topk, TopK)
+                                 and exp_args.get("draft_topk_method", "vanilla") == "cache_aware"
+                                 and exp_args["cache_dynamic_cap"] > 0)
+            cached_experts = None
+            tpr = (num_tokens // forward_batch.batch_size) if forward_batch.batch_size else 1
+            if draft_cache_aware:
+                for rid in forward_batch.rids:
+                    if rid not in self.cache:
+                        self.cache[rid] = Cache(self.layer_id, rid, self.num_experts,
+                                                static_cap=0,
+                                                dynamic_cap=exp_args["cache_dynamic_cap"],
+                                                record_activations=False)
+                cached_experts = [self.cache[rid].get_experts_in_cache()
+                                  for rid in forward_batch.rids for _ in range(tpr)]
+            if isinstance(self.topk, TopK):
+                topk_output = self.topk(hidden_states, router_logits)
+            else:
+                topk_output = self.topk(hidden_states, router_logits, cached_experts)
+            if draft_cache_aware:
+                selected = topk_output.topk_ids
+                for i, rid in enumerate(forward_batch.rids):
+                    for t in range(tpr):
+                        self.cache[rid]._update_lru(selected[i * tpr + t].tolist())
+            return self.experts(hidden_states, topk_output)
+
+        is_decode = bs == num_tokens
+        is_verify = forward_batch.forward_mode.is_target_verify()
+        # Decode and target-verify both use cache-aware routing + prefetch +
+        # recording + cache updates. A verify step packs tokens_per_req candidate
+        # tokens per request, grouped by request along the token axis:
+        # [req0_tok0..tokK, req1_tok0..tokK, ...].
+        is_step = is_decode or is_verify
+        tokens_per_req = (num_tokens // bs) if is_verify else 1
+
+        if is_step:
+            # Predict/prefetch once per request. In verify we feed the first
+            # candidate token of each request (rows 0, tpr, 2*tpr, ...) so the
+            # predictor sees one row per request, matching len(rids).
+            pred_hidden = hidden_states[0::tokens_per_req] if is_verify else hidden_states
+            early_gate.make_pred(self.layer_id, pred_hidden, forward_batch.rids)
             prefetch_experts = early_gate.get_pred(self.layer_id)
             if prefetch_experts:
                 for i, rid in enumerate(forward_batch.rids):
                     self.cache[rid].prefetch(prefetch_experts[i])
 
-            cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
+            # One cached-expert snapshot per ROW; verify repeats each request's
+            # snapshot across its tokens_per_req candidate tokens (frozen snapshot).
+            cached_experts = [
+                self.cache[rid].get_experts_in_cache()
+                for rid in forward_batch.rids
+                for _ in range(tokens_per_req)
+            ]
         else:
             cached_experts = None
 
         if isinstance(self.topk, TopK):
             topk_output = self.topk(hidden_states, router_logits)
         else:
-            # cached_experts = [[e for e in range(256)] for _ in range(num_tokens)]
-            # cached_experts = None
-
             topk_output = self.topk(hidden_states, router_logits, cached_experts)
         selected = topk_output.topk_ids
 
         n_tokens = selected.shape[0]
 
         if is_decode: assert n_tokens == len(forward_batch.rids)
+        if is_verify: assert n_tokens == len(forward_batch.rids) * tokens_per_req
 
         for i, rid in enumerate(forward_batch.rids):
             if rid not in RIDS: RIDS.append(rid)
@@ -865,7 +980,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 self.cache[rid] = Cache(self.layer_id, rid, self.num_experts, exp_args["cache_static_cap"], exp_args["cache_dynamic_cap"], record_activations=record_activations)
                 CacheRegistry.add(self.cache[rid])
 
-            self.cache[rid].read(selected[i].tolist(), is_decode)
+            if is_verify:
+                rows = [selected[i * tokens_per_req + t].tolist()
+                        for t in range(tokens_per_req)]
+                self.cache[rid].read_verify(rows)
+            else:
+                self.cache[rid].read(selected[i].tolist(), is_decode)
 
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output

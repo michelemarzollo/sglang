@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -647,7 +649,23 @@ class SchedulerOutputProcessorMixin:
             self.maybe_collect_routed_experts(req)
             self.maybe_collect_indexer_topk(req)
             self.tp_worker.model_runner.model.flush_cache(req.rid)
-            
+
+            # Cache-aware MoE: capture per-request speculative accept totals
+            # (only known after verify) so the roofline simulator can credit
+            # throughput by accepted tokens. Paired with the expert trace by rid.
+            _exp_dir = os.environ.get("EXP_DIR")
+            _verify_ct = getattr(req, "spec_verify_ct", 0)
+            if _exp_dir and _verify_ct:
+                try:
+                    with open(os.path.join(_exp_dir, "accept_stats.jsonl"), "a") as _f:
+                        _f.write(json.dumps({
+                            "rid": req.rid,
+                            "num_correct_drafts": getattr(req, "spec_num_correct_drafts", 0),
+                            "verify_ct": _verify_ct,
+                        }) + "\n")
+                except OSError:
+                    pass
+
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
