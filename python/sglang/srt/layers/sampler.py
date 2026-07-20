@@ -755,11 +755,22 @@ def apply_custom_logit_processor(
         )
         batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
 
+        # Under speculative decoding each request contributes num_tokens_in_batch
+        # rows to `logits` (the draft positions verified this step), and the
+        # processors pair logits row r with custom_param_list[r]. The params must
+        # therefore be expanded to one-per-row, not one-per-request: otherwise only
+        # the first row of each request is processed and the remaining draft
+        # positions are left unmodified (e.g. the thinking-budget cap silently
+        # fails to force </think> under spec decode). No-op when
+        # num_tokens_in_batch == 1 (the plain-decode path).
+        params = [
+            sampling_batch_info.custom_params[i]
+            for i in batch_indices
+            for _ in range(num_tokens_in_batch)
+        ]
+
         # Apply the processor to the logits
-        logits[batch_mask] = processor(
-            logits[batch_mask],
-            [sampling_batch_info.custom_params[i] for i in batch_indices],
-        )
+        logits[batch_mask] = processor(logits[batch_mask], params)
 
         logger.debug(
             f"Custom logit processor {processor.__class__.__name__} is applied."

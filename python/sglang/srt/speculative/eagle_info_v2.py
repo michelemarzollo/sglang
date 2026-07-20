@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +15,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
@@ -382,6 +384,26 @@ class EagleVerifyInputV2Mixin:
             assert self.grammar is not None
             self.grammar.apply_vocab_mask(
                 logits=next_token_logits, vocab_mask=vocab_mask
+            )
+
+        # Apply custom logit processors (e.g. the thinking-budget cap). The v2
+        # verify path otherwise skips them entirely — unlike v1/ngram/dflash — so
+        # per-request processors silently no-op under spec decode (this is why the
+        # </think> cap never fired for K>0). next_token_logits holds draft_token_num
+        # rows per request, so pass num_tokens_in_batch accordingly; the params are
+        # expanded one-per-row inside apply_custom_logit_processor.
+        if sampling_info.has_custom_logit_processor:
+            cl_info = sampling_info
+            if bs != len(sampling_info):
+                # retrieve_index are the request indices kept this step.
+                cl_info = copy.deepcopy(sampling_info)
+                cl_info.filter_batch(
+                    self.retrieve_index.tolist(), self.retrieve_index
+                )
+            apply_custom_logit_processor(
+                next_token_logits,
+                cl_info,
+                num_tokens_in_batch=self.draft_token_num,
             )
 
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
