@@ -227,6 +227,14 @@ class CacheRegistry:
         assert layer_id in CacheRegistry._reg[rid], f"rid={rid}, layer_id={layer_id} not in registry."
         return CacheRegistry._reg[rid][layer_id]
 
+    @staticmethod
+    def commit_verify_for_request(rid, accept_mask):
+        """Reconcile every layer's cache for `rid` against accept/reject,
+        once known post-sample(). No-op if `rid` was never registered (e.g.
+        non-cache-aware models, or a request that hit no MoE layer)."""
+        for cache in CacheRegistry._reg.get(rid, {}).values():
+            cache.commit_verify(accept_mask)
+
 class Cache:
     def __init__(self, layer_id, rid, num_experts, static_cap, dynamic_cap, record_activations=False) -> None:
         self.static_cap = static_cap
@@ -254,6 +262,10 @@ class Cache:
         # tracks per-expert usage frequency for this request, used by LFU evict.
         self.policy = exp_args.get("cache_policy", "lru")
         self.access_ct = {}
+
+        # Rows recorded by record_verify(), pending reconciliation against
+        # accept/reject via commit_verify() once verify_input.sample() knows it.
+        self._pending_verify_rows = None
 
         self.init_random()
 
@@ -327,16 +339,20 @@ class Cache:
                 self.evict()
                 self.dynamic_dat[e] = 0
 
-    def read_verify(self, tokens_experts):
-        """Record one speculative *verify* step (K+1 candidate tokens).
-
-        All candidate tokens route against the SAME frozen cache snapshot, then
-        the dynamic LRU is updated with ALL experts used in verification (not
-        just accepted ones) — decided to be fine and potentially better for
-        future-activation prediction. `tokens_experts` is a list of per-token
+    def record_verify(self, tokens_experts):
+        """Record one speculative *verify* step (draft_token_num candidate
+        tokens per request). All candidate tokens route against the SAME
+        frozen cache snapshot; hit/miss stats and activation logging cover
+        ALL of them, mirroring real hardware which computes every candidate
+        regardless of accept/reject. `tokens_experts` is a list of per-token
         expert lists; recorded as a list-of-lists so parse_spec_decode can
-        recover per-expert row counts. accept_len is captured separately from
-        the API meta_info, not here (it is only known after the forward)."""
+        recover per-expert row counts.
+
+        The dynamic LRU/LFU is NOT updated here: accept/reject is only known
+        after the forward pass, once verify_input.sample() returns. Call
+        commit_verify(accept_mask) with that result to update the cache using
+        only the tokens that actually end up in the output (accepted drafts +
+        bonus token)."""
         resident = set(self.static_dat) | set(self.dynamic_dat) | set(self.prefetched)
         flat = [e for tex in tokens_experts for e in tex]
         hits = [e for e in flat if e in resident]
@@ -358,7 +374,20 @@ class Cache:
                 }
             )
 
+        self._pending_verify_rows = tokens_experts
+
+    def commit_verify(self, accept_mask):
+        """Update the dynamic LRU/LFU from the verify step last recorded by
+        record_verify(), restricted to rows where accept_mask[t] is True —
+        i.e. candidate tokens that actually end up in the output (accepted
+        drafts + the bonus token). Must be called exactly once per
+        record_verify(), after accept/reject is known."""
+        rows = self._pending_verify_rows
+        assert rows is not None, "commit_verify() called without a matching record_verify()"
+        self._pending_verify_rows = None
+
         if self.dynamic_cap > 0:
+            flat = [e for tex, accepted in zip(rows, accept_mask) if accepted for e in tex]
             self._update_lru(flat)
 
     def get_experts_in_cache(self):
@@ -506,6 +535,13 @@ class EarlyGate:
         )
         self.is_enabled = self.n_preds > 0
 
+        # prefetch_per_token: during a verify step, predict for EVERY candidate
+        # token (not just the first) and prefetch the per-request UNION of their
+        # predictions, instead of one token-0 prediction broadcast to all K+1
+        # positions. Default False keeps the legacy behavior, so old
+        # exp_args.json (without this key) and in-flight runs are unaffected.
+        self.prefetch_per_token = exp_args.get("prefetch_per_token", False)
+
         # "early_gate" (default): run the future layer's gate on the current
         # hidden states. "trained": use the per-layer predictors trained in
         # the moe-activation-predictor repo (see expert_predictor.py).
@@ -592,10 +628,43 @@ class EarlyGate:
             for i in range(len(cached_experts))
         ]
 
+    def _expand_not_cached(self, not_cached_experts, tpr):
+        """Repeat each request's not-cached list tpr times so it lines up with
+        per-token (tpr>1) hidden-state rows. tpr==1 -> unchanged (per-request).
+        The not-cached set is per-(request,layer), so all tpr candidate rows of
+        a request legitimately share it."""
+        if tpr == 1:
+            return not_cached_experts
+        return [nc for nc in not_cached_experts for _ in range(tpr)]
+
+    def _store_pred(self, next_layer_id, topk_ids, n_req, tpr):
+        """topk_ids: [n_req*tpr, n_prefetch] predicted experts per row.
+
+        tpr==1 -> store the tensor as-is (legacy: one prediction per request).
+        tpr>1 (prefetch_per_token during verify) -> union each request's tpr
+        per-token predictions into one deduped list, so the request prefetches
+        every expert any of its candidate tokens wants."""
+        if tpr == 1:
+            self.preds[next_layer_id] = topk_ids
+            return
+        preds = []
+        for i in range(n_req):
+            seen = {}  # dict: dedupe while preserving first-seen order
+            for t in range(tpr):
+                for e in topk_ids[i * tpr + t].tolist():
+                    seen[e] = None
+            preds.append(list(seen))
+        self.preds[next_layer_id] = preds
+
     def make_pred(self, layer_id, hidden_states, rids=None):
         if not self.is_enabled: return
 
-        next_layer_id = layer_id+self.prefetch_offset
+        next_layer_id = layer_id + self.prefetch_offset
+        n_rows = hidden_states.shape[0]
+        n_req = len(rids) if rids is not None else n_rows
+        # tpr>1 only when the caller feeds every per-token row (prefetch_per_token
+        # in verify); otherwise 1 (decode, or the legacy token-0 verify slice).
+        tpr = (n_rows // n_req) if n_req else 1
 
         if self.predictor_mode == "trained":
             predictor = self._get_predictor(next_layer_id)
@@ -606,11 +675,12 @@ class EarlyGate:
                     rids,
                     logits.shape[-1],
                 )
-                self.preds[next_layer_id] = self.topk(
+                topk_ids = self.topk(
                     hidden_states,
                     logits,
-                    not_cached_experts,
+                    self._expand_not_cached(not_cached_experts, tpr),
                 ).topk_ids
+                self._store_pred(next_layer_id, topk_ids, n_req, tpr)
             return
 
         if next_layer_id in self.gates:
@@ -623,13 +693,20 @@ class EarlyGate:
 
             next_gate = self.gates[next_layer_id]
             router_logits, _ = next_gate(hidden_states)
-            self.preds[next_layer_id] = self.topk(hidden_states, router_logits, not_cached_experts).topk_ids
+            topk_ids = self.topk(
+                hidden_states,
+                router_logits,
+                self._expand_not_cached(not_cached_experts, tpr),
+            ).topk_ids
+            self._store_pred(next_layer_id, topk_ids, n_req, tpr)
 
     def get_pred(self, layer_id):
         if not self.is_enabled: return None
 
         if layer_id in self.preds:
-            return self.preds[layer_id].tolist()
+            p = self.preds[layer_id]
+            # tensor (legacy per-request) or list-of-lists (per-token union).
+            return p if isinstance(p, list) else p.tolist()
         else:
             return None
 
@@ -941,10 +1018,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         tokens_per_req = (num_tokens // bs) if is_verify else 1
 
         if is_step:
-            # Predict/prefetch once per request. In verify we feed the first
-            # candidate token of each request (rows 0, tpr, 2*tpr, ...) so the
-            # predictor sees one row per request, matching len(rids).
-            pred_hidden = hidden_states[0::tokens_per_req] if is_verify else hidden_states
+            # Predict/prefetch experts for a future layer. Legacy verify feeds
+            # only the first candidate of each request (rows 0, tpr, 2*tpr, ...)
+            # so the predictor sees one row per request. With prefetch_per_token,
+            # feed ALL candidate rows so each token predicts from its own hidden
+            # state and the per-request union is prefetched (make_pred/_store_pred).
+            if is_verify and not early_gate.prefetch_per_token:
+                pred_hidden = hidden_states[0::tokens_per_req]
+            else:
+                pred_hidden = hidden_states
             early_gate.make_pred(self.layer_id, pred_hidden, forward_batch.rids)
             prefetch_experts = early_gate.get_pred(self.layer_id)
             if prefetch_experts:
@@ -976,14 +1058,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if rid not in RIDS: RIDS.append(rid)
 
             if rid not in self.cache:
-                record_activations = False if len(RIDS) <= 1 else rid == RIDS[1]
+                # Record every request except the very first (server/CUDA-graph
+                # warmup skews its timing) -- so the roofline replay can average
+                # over all documents in the trace instead of one arbitrary pick.
+                record_activations = rid != RIDS[0]
                 self.cache[rid] = Cache(self.layer_id, rid, self.num_experts, exp_args["cache_static_cap"], exp_args["cache_dynamic_cap"], record_activations=record_activations)
                 CacheRegistry.add(self.cache[rid])
 
             if is_verify:
                 rows = [selected[i * tokens_per_req + t].tolist()
                         for t in range(tokens_per_req)]
-                self.cache[rid].read_verify(rows)
+                self.cache[rid].record_verify(rows)
             else:
                 self.cache[rid].read(selected[i].tolist(), is_decode)
 

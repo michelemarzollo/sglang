@@ -1074,6 +1074,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
+        # Reconcile the cache-aware MoE expert cache against accept/reject:
+        # the forward pass above already recorded every candidate row via
+        # Cache.record_verify(); commit only the rows that actually end up in
+        # the output (accepted drafts + bonus token) into the dynamic LRU/LFU.
+        if not batch.forward_mode.is_idle():
+            from sglang.srt.models.qwen2_moe import CacheRegistry
+
+            draft_token_num = verify_input.draft_token_num
+            accept_lens_cpu = accept_lens.tolist()
+            accept_index_cpu = accept_index.tolist()
+            for i, rid in enumerate(verify_forward_batch.rids):
+                accept_mask = [False] * draft_token_num
+                for j in range(accept_lens_cpu[i]):
+                    accept_mask[accept_index_cpu[i][j] - i * draft_token_num] = True
+                CacheRegistry.commit_verify_for_request(rid, accept_mask)
+
         # Update mamba state for hybrid GDN models after verification
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
